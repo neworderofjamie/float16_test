@@ -233,7 +233,7 @@ __global__ void updateNeuronsKernelNaive16(half* RefracTime, half* V, uint32_t* 
     }
 }
 
-__global__ void updateNeuronsKernelVec16(half2* RefracTime, half2* V, uint32_t* recordSpk, curandState* rng, uint32_t numNeurons, unsigned int recordingTimestep)
+__global__ void updateNeuronsKernelVec16(half* RefracTime, half* V, uint32_t* recordSpk, curandState* rng, uint32_t numNeurons, unsigned int recordingTimestep)
  {
     const unsigned int id = 32 * blockIdx.x + threadIdx.x; 
     __shared__ uint32_t shSpkRecord[2];
@@ -243,8 +243,10 @@ __global__ void updateNeuronsKernelVec16(half2* RefracTime, half2* V, uint32_t* 
     __syncthreads();
     // merged0
     if(id < (numNeurons / 2)) {
-        const half2 _lRefracTime = RefracTime[id];
-        const half2 _lV = V[id];
+        half2 *RefracTimeVec = reinterpret_cast<half2*>(RefracTime);
+        half2 *VVec = reinterpret_cast<half2*>(V);
+        const half2 _lRefracTime = RefracTimeVec[id];
+        const half2 _lV = VVec[id];
         
         // Lower
         half _llRefracTime = __low2half(_lRefracTime);
@@ -306,8 +308,8 @@ __global__ void updateNeuronsKernelVec16(half2* RefracTime, half2* V, uint32_t* 
         
         
         // Re-combine
-        RefracTime[id] = __halves2half2(_llRefracTime, _lhRefracTime);
-        V[id] = __halves2half2(_llV, _lhV);
+        RefracTimeVec[id] = __halves2half2(_llRefracTime, _lhRefracTime);
+        VVec[id] = __halves2half2(_llV, _lhV);
     }
     __syncthreads();
     if(threadIdx.x < 2) {
@@ -418,15 +420,15 @@ int main(int argc, char *argv[])
         float *d_v = nullptr;
         half *d_refracTime16 = nullptr;
         half *d_v16 = nullptr;
-        half2 *d_refracTime16Vec = nullptr;
-        half2 *d_v16Vec = nullptr;
+        half *d_refracTime16Vec = nullptr;
+        half *d_v16Vec = nullptr;
         CHECK_CUDA_ERRORS(cudaMalloc(&d_rng, numNeurons * sizeof(curandState)));
         CHECK_CUDA_ERRORS(cudaMalloc(&d_refracTime, numNeurons * sizeof(float)));
         CHECK_CUDA_ERRORS(cudaMalloc(&d_v, numNeurons * sizeof(float)));
         CHECK_CUDA_ERRORS(cudaMalloc(&d_refracTime16, numNeurons * sizeof(half)));
         CHECK_CUDA_ERRORS(cudaMalloc(&d_v16, numNeurons * sizeof(half)));
-        CHECK_CUDA_ERRORS(cudaMalloc(&d_refracTime16Vec, numNeuronsVec * sizeof(half2)));
-        CHECK_CUDA_ERRORS(cudaMalloc(&d_v16Vec, numNeuronsVec * sizeof(half2)));
+        CHECK_CUDA_ERRORS(cudaMalloc(&d_refracTime16Vec, numNeurons * sizeof(half)));
+        CHECK_CUDA_ERRORS(cudaMalloc(&d_v16Vec, numNeurons * sizeof(half)));
 
         const dim3 threads(32, 1);
         const dim3 grid(((numNeurons + 31) / 32), 1);
@@ -454,7 +456,7 @@ int main(int argc, char *argv[])
             }
             
             {
-                initializeKernel16<<<grid, threads>>>(reinterpret_cast<half*>(d_refracTime16Vec), reinterpret_cast<half*>(d_v16Vec), numNeurons);
+                initializeKernel16<<<grid, threads>>>(d_refracTime16Vec, d_v16Vec, numNeurons);
                 CHECK_CUDA_ERRORS(cudaPeekAtLastError());
             }
         }
