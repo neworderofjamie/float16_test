@@ -321,6 +321,94 @@ __global__ void updateNeuronsKernelVec16(half* RefracTime, half* V, uint32_t* re
     }
 }
 
+__global__ void updateNeuronsKernelVec16Storage(half* RefracTime, half* V, uint32_t* recordSpk, curandState* rng, uint32_t numNeurons, unsigned int recordingTimestep)
+ {
+    const unsigned int id = 32 * blockIdx.x + threadIdx.x; 
+    __shared__ uint32_t shSpkRecord[2];
+    if (threadIdx.x < 2) {
+        shSpkRecord[threadIdx.x] = 0;
+    }
+    __syncthreads();
+    // merged0
+    if(id < (numNeurons / 2)) {
+        half2 *RefracTimeVec = reinterpret_cast<half2*>(RefracTime);
+        half2 *VVec = reinterpret_cast<half2*>(V);
+        const half2 _lRefracTime = RefracTimeVec[id];
+        const half2 _lV = VVec[id];
+        
+        // Lower
+        float _llRefracTime = __low2float(_lRefracTime);
+        float _llV = __low2float(_lV);
+        {
+            float Isyn = 0;
+            
+            {
+                // current source 0
+                Isyn += 0.000000000e+00f + (curand_normal(&rng[id]) * 1.000000000e+00f);
+            }
+            // test whether spike condition was fulfilled previously
+            // calculate membrane potential
+            if(_llRefracTime <= 0.0f) {
+                float _alpha = ((Isyn + 0.000000000e+00f) * 2.000000000e+01f) + -4.900000000e+01f;
+                _llV = _alpha - (9.512294245e-01f * (_alpha - _llV));
+            }
+            else {
+                _llRefracTime -= 1.000000000e+00f;
+            }
+            
+            // test for and register a true spike
+            if ((_llRefracTime <= 0.0f && _llV >= -5.000000000e+01f)) {
+                atomicOr(&shSpkRecord[threadIdx.x / 16], 1 << ((threadIdx.x % 16) * 2));
+                // spike reset code
+                _llV = -6.000000000e+01f;
+                _llRefracTime = 5.000000000e+00f;
+            }
+        }
+        
+        // Higher
+        float _lhRefracTime = __high2float(_lRefracTime);
+        float _lhV = __high2float(_lV);
+        {
+            float Isyn = 0;
+            
+            {
+                // current source 0
+                Isyn += 0.000000000e+00f + (curand_normal(&rng[id]) * 1.000000000e+00f);
+            }
+            // test whether spike condition was fulfilled previously
+            // calculate membrane potential
+            if(_lhRefracTime <= 0.0f) {
+                float _alpha = ((Isyn + 0.000000000e+00f) * 2.000000000e+01f) + -4.900000000e+01f;
+                _lhV = _alpha - (9.512294245e-01f * (_alpha - _lhV));
+            }
+            else {
+                _lhRefracTime -= 1.000000000e+00f;
+            }
+            
+            // test for and register a true spike
+            if ((_lhRefracTime <= 0.0f && _lhV >= -5.000000000e+01f)) {
+                atomicOr(&shSpkRecord[threadIdx.x / 16], 1 << (((threadIdx.x % 16) * 2) + 1));
+                // spike reset code
+                _lhV = -6.000000000e+01f;
+                _lhRefracTime = 5.000000000e+00f;
+            }
+        }
+        
+        
+        // Re-combine
+        RefracTimeVec[id] = __floats2half2_rn(_llRefracTime, _lhRefracTime);
+        VVec[id] = __floats2half2_rn(_llV, _lhV);
+    }
+    __syncthreads();
+    if(threadIdx.x < 2) {
+        const unsigned int numRecordingWords = (numNeurons + 31) / 32;
+        const unsigned int popWordIdx = (id / 16) + threadIdx.x;
+        if(popWordIdx < numRecordingWords) {
+            recordSpk[(recordingTimestep * numRecordingWords * 1) + popWordIdx] = shSpkRecord[threadIdx.x];
+        }
+    }
+}
+
 //-----------------------------------------------------------------------------
 // Host functions
 //-----------------------------------------------------------------------------
@@ -413,6 +501,7 @@ int main(int argc, char *argv[])
         auto recordSpk = allocateHostDevice<uint32_t>(numTimesteps * ((numNeurons + 31) / 32));
         auto recordSpk16 = allocateHostDevice<uint32_t>(numTimesteps * ((numNeurons + 31) / 32));
         auto recordSpk16Vec = allocateHostDevice<uint32_t>(numTimesteps * ((numNeurons + 31) / 32));
+        auto recordSpk16VecStorage = allocateHostDevice<uint32_t>(numTimesteps * ((numNeurons + 31) / 32));
         
         // Allocate device array for RNG
         curandState *d_rng = nullptr;
@@ -422,6 +511,8 @@ int main(int argc, char *argv[])
         half *d_v16 = nullptr;
         half *d_refracTime16Vec = nullptr;
         half *d_v16Vec = nullptr;
+        half *d_refracTime16VecStorage = nullptr;
+        half *d_v16VecStorage = nullptr;
         CHECK_CUDA_ERRORS(cudaMalloc(&d_rng, numNeurons * sizeof(curandState)));
         CHECK_CUDA_ERRORS(cudaMalloc(&d_refracTime, numNeurons * sizeof(float)));
         CHECK_CUDA_ERRORS(cudaMalloc(&d_v, numNeurons * sizeof(float)));
@@ -429,6 +520,8 @@ int main(int argc, char *argv[])
         CHECK_CUDA_ERRORS(cudaMalloc(&d_v16, numNeurons * sizeof(half)));
         CHECK_CUDA_ERRORS(cudaMalloc(&d_refracTime16Vec, numNeurons * sizeof(half)));
         CHECK_CUDA_ERRORS(cudaMalloc(&d_v16Vec, numNeurons * sizeof(half)));
+        CHECK_CUDA_ERRORS(cudaMalloc(&d_refracTime16VecStorage, numNeurons * sizeof(half)));
+        CHECK_CUDA_ERRORS(cudaMalloc(&d_v16VecStorage, numNeurons * sizeof(half)));
 
         const dim3 threads(32, 1);
         const dim3 grid(((numNeurons + 31) / 32), 1);
@@ -457,6 +550,11 @@ int main(int argc, char *argv[])
             
             {
                 initializeKernel16<<<grid, threads>>>(d_refracTime16Vec, d_v16Vec, numNeurons);
+                CHECK_CUDA_ERRORS(cudaPeekAtLastError());
+            }
+            
+            {
+                initializeKernel16<<<grid, threads>>>(d_refracTime16VecStorage, d_v16VecStorage, numNeurons);
                 CHECK_CUDA_ERRORS(cudaPeekAtLastError());
             }
         }
@@ -490,6 +588,16 @@ int main(int argc, char *argv[])
             cudaDeviceSynchronize();
         }
         saveSpikes(recordSpk16Vec, numNeurons, numTimesteps, "spikes_16_vec.csv");
+        
+        {
+            Timer<std::milli> t("Testing 16-bit vec storage:");
+        
+            for(int t = 0; t < numTimesteps; t++) {
+                updateNeuronsKernelVec16Storage<<<vecGrid, threads>>>(d_refracTime16VecStorage, d_v16VecStorage, recordSpk16VecStorage.second, d_rng, numNeurons, t);
+            }
+            cudaDeviceSynchronize();
+        }
+        saveSpikes(recordSpk16VecStorage, numNeurons, numTimesteps, "spikes_16_vec_storage.csv");
        
     }
     catch(const std::exception &ex) {
